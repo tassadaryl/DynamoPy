@@ -4,11 +4,20 @@ from hashlib import md5
 import time
 import random
 
-LATENCY_LOWER_BOUND = 100
-LATENCY_UPPER_BOUND = 1000
+LATENCY_LOWER_BOUND = 0
+LATENCY_UPPER_BOUND = 300
+DROP_RATE = 0.5
+RANDOM_LIST = [i for i in range(1, 101)]
 
-def latency():
+
+def _Latency():
     return float(random.randint(LATENCY_LOWER_BOUND, LATENCY_UPPER_BOUND)) / 1000.
+
+def _Drop():
+    RANDOM_NUM = random.choice(RANDOM_LIST)
+    if RANDOM_NUM <= int(100*DROP_RATE):
+        return True
+    return False
 
 class Node:
     def __init__(self, id):
@@ -18,20 +27,31 @@ class Node:
         self.vector_clock = defaultdict(dict)
         #key-value store
         self.kv_store = defaultdict(int)
-        #other server to communicate with
-        self.other_node_id = [i for i in range(1, 4) if i!=id]
         #this node's id
         self.my_node_id = id
+        #lock
+        self.lock = threading.Lock()
 
     def __repr__(self) -> str:
-        return "my id:{0}, kv:{1}, clock:{2}".format(self.my_node_id, self.kv_store, self.vector_clock)
-    # def __repr__(self) -> str:
-    #     return "my id:{0}".format(self.my_node_id)
+        return "Node id:{0}, kv:{1}, clock:{2}".format(self.my_node_id, self.kv_store, self.vector_clock)
+
+
+    def _Get_Coordinator(self, Request_key):
+        # print("CoordGet:term:{}, kv:{}, clock:{}".format(self.my_term, self.kv_store, self.vector_clock))
+
+        return self.kv_store[Request_key], self.vector_clock[Request_key]
 
     # get Requestkey's value and vector clock
     def _Get(self, Request_key):
-        print("term:{}, kv:{}, clock:{}".format(self.my_term, self.kv_store, self.vector_clock))
-        return self.kv_store[Request_key], self.vector_clock[Request_key]
+        time.sleep(_Latency())
+        if _Drop():
+            print("DROP in getting key:{} on Node:{}".format(Request_key, self.my_node_id))
+            return None, None
+        else:
+            # print("Get kv:{}, clock:{}".format(self.kv_store, self.vector_clock))
+            if Request_key not in self.kv_store:
+                return None, None
+            return self.kv_store[Request_key], self.vector_clock[Request_key]
 
 
     def _Put_Coordinator(self, Request_key, Request_val, Request_context=None):
@@ -40,26 +60,34 @@ class Node:
         self.vector_clock[Request_key].update(local_clock_update)
         self.kv_store[Request_key] = Request_val
 
-        print("PutCoord: node:{} term:{}, kv:{}, clock:{}".format(self.my_node_id, self.my_term, self.kv_store, self.vector_clock))
+        # print("PutCoord: node:{} term:{}, kv:{}, clock:{}".format(self.my_node_id, self.my_term, self.kv_store, self.vector_clock))
         return self.vector_clock[Request_key]
 
 
     # Gurantee Write Operation
     def _Put(self, Request_key, Request_val, Request_context):
-        time.sleep(latency())
-        #update coordinators's request
-        self.kv_store[Request_key] = Request_val
-        self.vector_clock[Request_key].update(Request_context)
+        time.sleep(_Latency())
+        if _Drop():
+            print("DROP in putting key:{} of val:{} on Node:{}".format(Request_key, Request_val, self.my_node_id))
+            pass
+        else:
+            #update coordinators's request
+            self.kv_store[Request_key] = Request_val
+            self.vector_clock[Request_key].update(Request_context)
 
-        print("Put: node:{} term:{}, kv:{}, clock:{}".format(self.my_node_id, self.my_term, self.kv_store, self.vector_clock))
-        return "success"
+            # print("Put: node:{} term:{}, kv:{}, clock:{}".format(self.my_node_id, self.my_term, self.kv_store, self.vector_clock))
+            return "success"
+
+    def _Reconcile_Coordinator(self, Reconciled_key, Reconciled_val ,Reconciled_vector_clock):
+        return
 
     # Reconcile when conflicting during Read Op
     def _Reconcile(self, Reconciled_key, Reconciled_val ,Reconciled_vector_clock):
+        # time.sleep(_Latency())
         self.kv_store[Reconciled_key] = Reconciled_val
         self.vector_clock[Reconciled_key] = Reconciled_vector_clock
 
-        print("term:{}, kv:{}, clock:{}".format(self.my_term, self.kv_store, self.vector_clock))
+        # print("term:{}, kv:{}, clock:{}".format(self.my_term, self.kv_store, self.vector_clock))
         return "success"
 
 
@@ -84,51 +112,68 @@ class Dynamo:
         if key not in self.preference_list:
             return "Key not in kv_store"
         
+        print("Querying key:{}".format(key))
+        
         node_coord = self.preference_list[key][0]
         node_rest1, node_rest2 = self.preference_list[key][1], self.preference_list[key][2]
 
-        kv_coord, clock_coord = node_coord._Get(key)
+        val_coord, clock_coord = node_coord._Get_Coordinator(key)
         return_R = []
 
         t1 = threading.Thread(target=self._ThreadGet, args=(node_rest1, key, return_R))
         t2 = threading.Thread(target=self._ThreadGet, args=(node_rest2, key, return_R))
         t1.start()
         t2.start()
+
+        timeout_flag = False
+        timeout = time.time() + 1
         while 1:
-            if len(return_R) >= self.R - 1:
+            if len(return_R) >= self.R - 1 or time.time() > timeout:
+                if time.time() > timeout:
+                    timeout_flag = True
+                    print("TIMEOUT on getting key:{}".format(key))
                 break
         
-        val_uptodate = kv_coord
+        val_uptodate = val_coord
         clock_uptodate = clock_coord
+        node_uptodate = node_coord
         reconcile_flag = False
 
-        for node, kv, clock in return_R:
-            if val_uptodate != kv:
+        for node, val, clock in return_R:
+            if val_uptodate != val:
                 reconcile_flag = True
                 compare_value = self._CompareClock(clock_uptodate, clock)
                 if compare_value == 1:
                     pass
                 elif compare_value == 2:
-                    val_uptodate = kv
+                    val_uptodate = val
                     clock_uptodate = clock
+                    node_uptodate = node
                 else:
                     #simplied version, TODO: choose which one to update/merge
                     pass
 
+        t1.join()
+        t2.join()
         # if reconcile is needed
-        if reconcile_flag:
-            #update it self
+        if reconcile_flag :
+            node_uptodate.my_term += 1
+            clock_uptodate[node_uptodate.my_node_id] = node_uptodate.my_term
+            #update itself
             self._Dreconcile(node_coord, key, val_uptodate, clock_uptodate)
             #update others
             treconcile1 = threading.Thread(target=self._Dreconcile, args=(node_rest1, key, val_uptodate, clock_uptodate))
             treconcile2 = threading.Thread(target=self._Dreconcile, args=(node_rest2, key, val_uptodate, clock_uptodate))
             treconcile1.start()
             treconcile2.start()
-            print("reconciled!")
+            print("Reconciled on key:{} of val:{}".format(key, val_uptodate))
 
+        if not timeout_flag:
+            print("Get key:{}, val:{}".format(key, val_uptodate))
         return val_uptodate
 
     def _Dput(self, key, val):
+        print("Put key:{}, val:{}".format(key, val))
         if key not in self.preference_list:
             self._InitializeKey(key)
         
@@ -143,10 +188,14 @@ class Dynamo:
         t2 = threading.Thread(target=self._ThreadPut, args=(node_rest2, key, val, clock_coord, return_W))
         t1.start()
         t2.start()
+        timeout = time.time() + 1
         while 1:
-            if len(return_W) >= self.W - 1:
+            if len(return_W) >= self.W - 1 or time.time() > timeout:
                 break
-        
+
+        # t1.join()
+        # t2.join()
+
         return "Dynamo put success"
 
     def _Dreconcile(self, node:Node, key, val, clock):
@@ -154,8 +203,10 @@ class Dynamo:
         return
 
     def _ThreadGet(self, node:Node, key, return_R):
-        kv, clock = node._Get(key)
-        return_R.append([node, kv, clock])
+        val, clock = node._Get(key)
+        if val == None:
+            return
+        return_R.append([node, val, clock])
         return
 
     def _ThreadPut(self, node:Node, key, val, clock, return_W):
@@ -188,7 +239,7 @@ class Dynamo:
         for i in range(key_hash, key_hash + self.N):
             self.preference_list[key].append(self.node_list[i % self.M])
 
-        print("key:{}, preference list:{}".format(key, self.preference_list[key]))
+        # print("key:{}, preference list:{}".format(key, self.preference_list[key]))
         return
 
     def _Dhash(self, key, mod):
@@ -204,8 +255,11 @@ class Dynamo:
         return hash_value
 
     def _Inspect(self):
+        print("-------------Inspect--------------")
         for i in range(5):
             print(self.node_list[i])
+        print("-------------Inspect--------------")
+        
 
 
 
@@ -221,27 +275,33 @@ if  __name__ == "__main__":
 
     dynamo = Dynamo()
     thread_pool_put = []
-    for i in range(10):
-        # dynamo._Dput(0, i)
-        thread_pool_put.append(threading.Thread(target=dput, args=(dynamo, i, i)))
+    Put_Num = 20
+    # for i in range(Put_Num):
+    #     # dynamo._Dput(0, i)
+    #     thread_pool_put.append(threading.Thread(target=dput, args=(dynamo, i%5, i)))
 
-    for i in range(10):
-        thread_pool_put[i].start()
-    for i in range(10):
-        thread_pool_put[i].join()
-
-    thread_pool_get = []
-    for i in range(10):
-        thread_pool_get.append(threading.Thread(target=dget, args=(dynamo, i)))
-
-    for i in range(10):
-        thread_pool_get[i].start()
-    for i in range(10):
-        thread_pool_get[i].join()
-
-
+    # for i in range(Put_Num):
+    #     thread_pool_put[i].start()
+    # for i in range(Put_Num):
+    #     thread_pool_put[i].join()
+    for i in range(Put_Num):
+        dynamo._Dput(i%5, i)  
     
-    
+    dynamo._Inspect()
+    time.sleep(2)
+
+    Get_Num = 5
+    # thread_pool_get = []
+    # for i in range(Get_Num):
+    #     thread_pool_get.append(threading.Thread(target=dget, args=(dynamo, i%5)))
+
+    # for i in range(Get_Num):
+    #     thread_pool_get[i].start()
+    # for i in range(Get_Num):
+    #     thread_pool_get[i].join()
+    for i in range(Get_Num):
+        dynamo._Dget(i%5)
+
 
 
     dynamo._Inspect()
