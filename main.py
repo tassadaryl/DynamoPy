@@ -3,15 +3,20 @@ import threading
 from hashlib import md5
 import time
 import random
+import numpy as np
 
 LATENCY_LOWER_BOUND = 0
 LATENCY_UPPER_BOUND = 300
-DROP_RATE = 0.5
+DROP_RATE = 0.0
 RANDOM_LIST = [i for i in range(1, 101)]
+MU_WRITE, SIGMA_WRITE = 0.025, 0.02
+MU_READ, SIGMA_READ = 0.1, 0.02
 
 
-def _Latency():
-    return float(random.randint(LATENCY_LOWER_BOUND, LATENCY_UPPER_BOUND)) / 1000.
+#return latency sampled from a guassian distribution
+def _Latency(mu=0.1, sigma=0.02):
+    sample = np.random.normal(mu, sigma, 1)[0]
+    return max(0, sample)
 
 def _Drop():
     RANDOM_NUM = random.choice(RANDOM_LIST)
@@ -37,18 +42,16 @@ class Node:
 
 
     def _Get_Coordinator(self, Request_key):
-        # print("CoordGet:term:{}, kv:{}, clock:{}".format(self.my_term, self.kv_store, self.vector_clock))
 
         return self.kv_store[Request_key], self.vector_clock[Request_key]
 
     # get Requestkey's value and vector clock
     def _Get(self, Request_key):
-        time.sleep(_Latency())
+        time.sleep(_Latency(MU_READ, SIGMA_READ))
         if _Drop():
             print("DROP in getting key:{} on Node:{}".format(Request_key, self.my_node_id))
             return None, None
         else:
-            # print("Get kv:{}, clock:{}".format(self.kv_store, self.vector_clock))
             if Request_key not in self.kv_store:
                 return None, None
             return self.kv_store[Request_key], self.vector_clock[Request_key]
@@ -60,13 +63,12 @@ class Node:
         self.vector_clock[Request_key].update(local_clock_update)
         self.kv_store[Request_key] = Request_val
 
-        # print("PutCoord: node:{} term:{}, kv:{}, clock:{}".format(self.my_node_id, self.my_term, self.kv_store, self.vector_clock))
         return self.vector_clock[Request_key]
 
 
     # Gurantee Write Operation
     def _Put(self, Request_key, Request_val, Request_context):
-        time.sleep(_Latency())
+        time.sleep(_Latency(MU_WRITE, SIGMA_WRITE))
         if _Drop():
             print("DROP in putting key:{} of val:{} on Node:{}".format(Request_key, Request_val, self.my_node_id))
             pass
@@ -75,7 +77,6 @@ class Node:
             self.kv_store[Request_key] = Request_val
             self.vector_clock[Request_key].update(Request_context)
 
-            # print("Put: node:{} term:{}, kv:{}, clock:{}".format(self.my_node_id, self.my_term, self.kv_store, self.vector_clock))
             return "success"
 
     def _Reconcile_Coordinator(self, Reconciled_key, Reconciled_val ,Reconciled_vector_clock):
@@ -87,7 +88,6 @@ class Node:
         self.kv_store[Reconciled_key] = Reconciled_val
         self.vector_clock[Reconciled_key] = Reconciled_vector_clock
 
-        # print("term:{}, kv:{}, clock:{}".format(self.my_term, self.kv_store, self.vector_clock))
         return "success"
 
 
@@ -104,6 +104,8 @@ class Dynamo:
         self.node3 = Node(3)
         self.node4 = Node(4)
         self.node_list = [self.node0, self.node1, self.node2, self.node3, self.node4]
+
+        self.record = []
 
         #preference list   {key : preference node list}
         self.preference_list = defaultdict(list)
@@ -139,6 +141,11 @@ class Dynamo:
         node_uptodate = node_coord
         reconcile_flag = False
 
+        node_status = []
+        for node in self.preference_list[key]:
+            node_status.append(node.kv_store[key] if key in node.kv_store else -1)
+        print(node_status)
+
         for node, val, clock in return_R:
             if val_uptodate != val:
                 reconcile_flag = True
@@ -155,6 +162,7 @@ class Dynamo:
 
         t1.join()
         t2.join()
+
         # if reconcile is needed
         if reconcile_flag :
             node_uptodate.my_term += 1
@@ -170,6 +178,12 @@ class Dynamo:
 
         if not timeout_flag:
             print("Get key:{}, val:{}".format(key, val_uptodate))
+        
+        if not timeout_flag and not reconcile_flag and node_status[0] == node_status[1] and node_status[0] == node_status[2]:
+            self.record.append(1)
+        else:
+            self.record.append(0)
+
         return val_uptodate
 
     def _Dput(self, key, val):
@@ -259,9 +273,11 @@ class Dynamo:
         for i in range(5):
             print(self.node_list[i])
         print("-------------Inspect--------------")
+
+    def _Pconsistent(self):
+        print(len([i for i in self.record if i == 1]) / 100.)
+        return
         
-
-
 
 
 def dput(dynamo: Dynamo, key, val):
@@ -269,42 +285,21 @@ def dput(dynamo: Dynamo, key, val):
 
 
 def dget(dynamo: Dynamo, key):
+    time.sleep(0.1)
     dynamo._Dget(key)
 
 if  __name__ == "__main__":
 
     dynamo = Dynamo()
-    thread_pool_put = []
-    Put_Num = 20
-    # for i in range(Put_Num):
-    #     # dynamo._Dput(0, i)
-    #     thread_pool_put.append(threading.Thread(target=dput, args=(dynamo, i%5, i)))
+    for i in range(100):
+        t1 = threading.Thread(target=dput, args=(dynamo, 1, i))
+        t2 = threading.Thread(target=dget, args=(dynamo, 1))
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
 
-    # for i in range(Put_Num):
-    #     thread_pool_put[i].start()
-    # for i in range(Put_Num):
-    #     thread_pool_put[i].join()
-    for i in range(Put_Num):
-        dynamo._Dput(i%5, i)  
-    
-    dynamo._Inspect()
-    time.sleep(2)
-
-    Get_Num = 5
-    # thread_pool_get = []
-    # for i in range(Get_Num):
-    #     thread_pool_get.append(threading.Thread(target=dget, args=(dynamo, i%5)))
-
-    # for i in range(Get_Num):
-    #     thread_pool_get[i].start()
-    # for i in range(Get_Num):
-    #     thread_pool_get[i].join()
-    for i in range(Get_Num):
-        dynamo._Dget(i%5)
-
-
-
-    dynamo._Inspect()
+    dynamo._Pconsistent()
 
 
 
